@@ -2,6 +2,7 @@ package sensehat
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,4 +37,38 @@ func isI2CEnabled() (bool, error) {
 
 	// I2C is enabled if the output is "0"
 	return strings.TrimSpace(string(output)) == "0", nil
+}
+
+func findFrameBufferDevice() (string, error) {
+	var device string
+
+	// Search through all framebuffer devices
+	globPattern := "/sys/class/graphics/fb*"
+	files, err := filepath.Glob(globPattern)
+	if err != nil {
+		return "", fmt.Errorf("error finding framebuffer devices: %v", err)
+	}
+
+	for _, fb := range files {
+		nameFile := filepath.Join(fb, "name")
+
+		// Check if "name" file exists and read it
+		if _, err := os.Stat(nameFile); err == nil {
+			nameData, err := os.ReadFile(nameFile)
+			if err != nil {
+				return "", fmt.Errorf("error reading name file: %v", err)
+			}
+			name := strings.TrimSpace(string(nameData))
+
+			if name == "RPiSense FB" {
+				fbDevice := filepath.Join("/dev", filepath.Base(fb))
+				if _, err := os.Stat(fbDevice); err == nil {
+					device = fbDevice
+					break
+				}
+			}
+		}
+	}
+
+	return device, nil
 }

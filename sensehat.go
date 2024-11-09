@@ -9,8 +9,6 @@ import (
 	_ "image/png"
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"golang.org/x/image/bmp"
 )
@@ -19,42 +17,8 @@ type SenseHat struct {
 	FbDevice string
 	Color    ColourSensor
 
-	Rotation int     // Rotation value (0, 90, 180, or 270)
-	PixMap   [][]int // Pixel map based on rotation
-}
-
-func findFrameBufferDevice() (string, error) {
-	var device string
-
-	// Search through all framebuffer devices
-	globPattern := "/sys/class/graphics/fb*"
-	files, err := filepath.Glob(globPattern)
-	if err != nil {
-		return "", fmt.Errorf("error finding framebuffer devices: %v", err)
-	}
-
-	for _, fb := range files {
-		nameFile := filepath.Join(fb, "name")
-
-		// Check if "name" file exists and read it
-		if _, err := os.Stat(nameFile); err == nil {
-			nameData, err := os.ReadFile(nameFile)
-			if err != nil {
-				return "", fmt.Errorf("error reading name file: %v", err)
-			}
-			name := strings.TrimSpace(string(nameData))
-
-			if name == "RPiSense FB" {
-				fbDevice := filepath.Join("/dev", filepath.Base(fb))
-				if _, err := os.Stat(fbDevice); err == nil {
-					device = fbDevice
-					break
-				}
-			}
-		}
-	}
-
-	return device, nil
+	Rotation int             // Rotation value (0, 90, 180, or 270)
+	PixMap   map[int][][]int // Map of rotations to pixel maps
 }
 
 // NewSenseHat creates a new SenseHat object
@@ -66,7 +30,9 @@ func NewSenseHat() *SenseHat {
 		return nil
 	}
 
-	return &SenseHat{}
+	sh := &SenseHat{}
+	sh.initializePixMap()
+	return sh
 }
 
 func (sh *SenseHat) Open() error {
@@ -87,6 +53,11 @@ func (sh *SenseHat) Open() error {
 	sh.FbDevice = device
 
 	// setup other sensors
+	colorSensor, err := NewColourSensor()
+	if err != nil {
+		return fmt.Errorf("error initializing color sensor: %v", err)
+	}
+	sh.Color = *colorSensor
 
 	return nil
 }
@@ -94,6 +65,72 @@ func (sh *SenseHat) Open() error {
 func (sh *SenseHat) Close() error {
 	// close sensors
 	return nil
+}
+
+// initializePixMap sets the initial PixMap based on the rotation
+func (sh *SenseHat) initializePixMap() {
+	// Define the pixel map for each rotation (0, 90, 180, 270)
+	pixMap0 := [][]int{
+		{0, 1, 2, 3, 4, 5, 6, 7},
+		{8, 9, 10, 11, 12, 13, 14, 15},
+		{16, 17, 18, 19, 20, 21, 22, 23},
+		{24, 25, 26, 27, 28, 29, 30, 31},
+		{32, 33, 34, 35, 36, 37, 38, 39},
+		{40, 41, 42, 43, 44, 45, 46, 47},
+		{48, 49, 50, 51, 52, 53, 54, 55},
+		{56, 57, 58, 59, 60, 61, 62, 63},
+	}
+
+	// Rotate the matrix for 90, 180, and 270 degrees
+	pixMap90 := rotateMatrix(pixMap0, 90)
+	pixMap180 := rotateMatrix(pixMap0, 180)
+	pixMap270 := rotateMatrix(pixMap0, 270)
+
+	// Set PixMap for different rotations
+	sh.PixMap = map[int][][]int{
+		0:   pixMap0,
+		90:  pixMap90,
+		180: pixMap180,
+		270: pixMap270,
+	}
+
+	// Set default rotation to 0 (can be changed later)
+	sh.Rotation = 0
+}
+
+// rotateMatrix rotates the 8x8 matrix by the given degrees
+func rotateMatrix(m [][]int, degrees int) [][]int {
+	// Handle rotation by 90, 180, and 270 degrees
+	n := len(m)
+	result := make([][]int, n)
+	for i := range result {
+		result[i] = make([]int, n)
+	}
+
+	switch degrees {
+	case 90:
+		for i := 0; i < n; i++ {
+			for j := 0; j < n; j++ {
+				result[j][n-i-1] = m[i][j]
+			}
+		}
+	case 180:
+		for i := 0; i < n; i++ {
+			for j := 0; j < n; j++ {
+				result[n-i-1][n-j-1] = m[i][j]
+			}
+		}
+	case 270:
+		for i := 0; i < n; i++ {
+			for j := 0; j < n; j++ {
+				result[n-j-1][i] = m[i][j]
+			}
+		}
+	default:
+		// No rotation needed for 0 degrees
+		copy(result, m)
+	}
+	return result
 }
 
 // pixel utils
@@ -114,13 +151,15 @@ func (sh *SenseHat) MatrixGetPixel(x, y int) (RGBColour, error) {
 	if err != nil {
 		return rgb, fmt.Errorf("failed to open framebuffer device: %w", err)
 	}
+	defer file.Close()
 
-	// Get the position in the pixel map based on rotation
-	if sh.Rotation < 0 || sh.Rotation >= len(sh.PixMap) {
+	// Ensure the rotation exists in PixMap
+	pixMap, exists := sh.PixMap[sh.Rotation]
+	if !exists {
 		return rgb, errors.New("invalid rotation value")
 	}
-	// row, column; multiply by 2 as each pixel is 2 bytes
-	offset := sh.PixMap[sh.Rotation][y*8+x] * 2
+	// Get the pixel offset (y * 8 + x) and multiply by 2 as each pixel is 2 bytes
+	offset := pixMap[y][x] * 2
 
 	// Seek to the correct offset
 	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
@@ -153,11 +192,14 @@ func (sh *SenseHat) MatrixSetPixel(x, y int, colour RGBColour) error {
 	}
 	defer file.Close()
 
-	// Get the position in the pixel map based on rotation
-	if sh.Rotation < 0 || sh.Rotation >= len(sh.PixMap) {
+	// Ensure the rotation exists in PixMap
+	pixMap, exists := sh.PixMap[sh.Rotation]
+	if !exists {
 		return errors.New("invalid rotation value")
 	}
-	offset := sh.PixMap[sh.Rotation][y*8+x] * 2 // row, column; multiply by 2 as each pixel is 2 bytes
+
+	// Get the pixel offset (y * 8 + x) and multiply by 2 as each pixel is 2 bytes
+	offset := pixMap[y][x] * 2
 
 	// Seek to the correct offset
 	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
@@ -191,18 +233,20 @@ func (sh *SenseHat) MatrixSetPixels(pixelList []RGBColour) error {
 	}
 	defer file.Close()
 
-	// Get the position in the pixel map based on rotation
-	if sh.Rotation < 0 || sh.Rotation >= len(sh.PixMap) {
+	// Get the pixel map for the current rotation (ensure it exists)
+	pmap, exists := sh.PixMap[sh.Rotation]
+	if !exists {
 		return errors.New("invalid rotation value")
 	}
-	pmap := sh.PixMap[sh.Rotation]
 
 	// Write the pixel data into the framebuffer
 	for index, pix := range pixelList {
 		// Get the row and column from the pixel map
 		row := index / 8
 		col := index % 8
-		offset := pmap[row*8+col] * 2 // Multiply by 2 since each pixel is 2 bytes (RGB565)
+
+		// Calculate the pixel offset (multiply by 2 because each pixel is 2 bytes in RGB565 format)
+		offset := pmap[row][col] * 2
 
 		// Seek to the correct offset in the framebuffer
 		if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
@@ -231,17 +275,17 @@ func (sh *SenseHat) MatrixGetPixels() ([]RGBColour, error) {
 	}
 	defer file.Close()
 
-	// Get the position in the pixel map based on rotation
-	if sh.Rotation < 0 || sh.Rotation >= len(sh.PixMap) {
+	// Get the pixel map for the current rotation (ensure it exists)
+	pmap, exists := sh.PixMap[sh.Rotation]
+	if !exists {
 		return nil, errors.New("invalid rotation value")
 	}
-	pmap := sh.PixMap[sh.Rotation]
 
 	// Read the pixel data from the framebuffer
 	for row := 0; row < 8; row++ {
 		for col := 0; col < 8; col++ {
-			// Calculate the offset in the framebuffer
-			offset := pmap[row*8+col] * 2
+			// Calculate the offset in the framebuffer (each pixel is 2 bytes)
+			offset := pmap[row][col] * 2
 
 			// Seek to the correct offset
 			if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
